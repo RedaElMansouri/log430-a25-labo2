@@ -13,6 +13,9 @@ services:
       REDIS_PORT: 6379
       REDIS_DB: 0
 
+    ports:
+      - "5001:5000" 
+
     depends_on:
       - mysql
       - redis
