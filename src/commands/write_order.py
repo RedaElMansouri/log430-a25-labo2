@@ -8,6 +8,7 @@ from models.order_item import OrderItem
 from models.order import Order
 from queries.read_order import get_orders_from_mysql
 from db import get_sqlalchemy_session, get_redis_conn
+import json
 
 def add_order(user_id: int, items: list):
     """Insert order with items in MySQL, keep Redis in sync"""
@@ -78,52 +79,93 @@ def add_order(user_id: int, items: list):
 def delete_order(order_id: int):
     """Delete order in MySQL, keep Redis in sync"""
     session = get_sqlalchemy_session()
+    committed = False
+    order = None
     try:
         order = session.query(Order).filter(Order.id == order_id).first()
-        
+
         if order:
             session.delete(order)
             session.commit()
-
-            # TODO: supprimer la commande à Redis
-            delete_order_from_redis(order_id)
-            return 1  
+            committed = True
+            return 1
         else:
-            return 0  
-            
+            return 0
     except Exception as e:
         session.rollback()
         raise e
     finally:
-        session.close()
+        try:
+            session.close()
+        except Exception:
+            pass
+
+        if committed and order:
+            try:
+                delete_order_from_redis(order_id)
+            except Exception as e:
+                print(f"Failed to delete order from redis after mysql commit: {e}")
 
 def add_order_to_redis(order_id, user_id, total_amount, items):
     """Insert order to Redis"""
     r = get_redis_conn()
-    print(r)
+    key = f"order:{order_id}"
+    r.hset(key, mapping={
+        'id': int(order_id),
+        'user_id': int(user_id),
+        'total_amount': float(total_amount),
+        'items': json.dumps(items)
+    })
+
+    for item in items:
+        pid = int(item.get('product_id'))
+        qty = item.get('quantity')
+        q_int = int(float(qty))
+        if float(qty) == float(q_int):
+            r.incrby(f"product:{pid}", q_int)
+        else:
+            r.incrbyfloat(f"product:{pid}", float(qty))
 
 def delete_order_from_redis(order_id):
     """Delete order from Redis"""
-    pass
+    r = get_redis_conn()
+    key = f"order:{order_id}"
+    r.delete(key)
 
 def sync_all_orders_to_redis():
     """ Sync orders from MySQL to Redis """
-    # redis
+    
     r = get_redis_conn()
-    orders_in_redis = r.keys(f"order:*")
-    rows_added = 0
+    sync_flag = 'orders:sync_done'
     try:
-        if len(orders_in_redis) == 0:
-            # mysql
-            orders_from_mysql = []
-            for order in orders_from_mysql:
-                # TODO: terminez l'implementation
-                print(order)
-            rows_added = len(orders_from_mysql)
-        else:
-            print('Redis already contains orders, no need to sync!')
+        if r.exists(sync_flag):
+            orders_in_redis = r.keys(f"order:*")
+            print('Redis already contains orders or sync already performed, no need to sync!')
+            return len(orders_in_redis)
+
+        orders_in_redis = r.keys(f"order:*")
+        if len(orders_in_redis) > 0:
+            r.set(sync_flag, 1)
+            print('Redis already contains orders, marking sync as done.')
+            return len(orders_in_redis)
+
+        orders_from_mysql = get_orders_from_mysql()
+        rows_added = 0
+        for order in orders_from_mysql:
+            items = []
+            for oi in getattr(order, 'order_items', []) or []:
+                items.append({
+                    'product_id': int(oi.product_id),
+                    'quantity': float(oi.quantity),
+                    'unit_price': float(oi.unit_price)
+                })
+
+            add_order_to_redis(order.id, order.user_id, order.total_amount, items)
+            rows_added += 1
+
+        r.set(sync_flag, 1)
+
+        return rows_added
     except Exception as e:
         print(e)
         return 0
-    finally:
-        return len(orders_in_redis) + rows_added
